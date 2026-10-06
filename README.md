@@ -1,91 +1,19 @@
 # chora-mcp-gateway
 
-Model Context Protocol (MCP) gateway exposing Chora capabilities to external AI
-agents (Claude Desktop, custom LLM-driven copilots) over JSON-RPC 2.0.
+## About
 
-This is the **MCP-as-a-Service** deliverable referenced by CHO-27 and the
-`domain-a2a` skill (MCP Gateway add-on). It complements `chora-a2a-gateway`:
-A2A serves agent-to-agent invocations under JWS signatures; MCP serves the
-JSON-RPC 2.0 protocol consumed by hosted LLM tools.
+chora-mcp-gateway is a Go HTTP service that exposes Chora capabilities to external clients through MCP-style JSON-RPC 2.0 endpoints. It authenticates callers with an `X-API-Key`, resolves the key through `chora-a2a-gateway` or a local development seed, and authorizes access by tool name. Tool calls are dispatched to Chora domain services over HTTP with the owning tenant propagated as `X-Tenant-Id`, and successful results include citations derived from upstream data.
 
-The service is standalone and provider-neutral. Shared Chora modules are
-consumed as Go modules (`github.com/apollo-chora/chora-common`). There is no
-database, no migrations, and no message-bus dependency; tracing uses OTLP
-(`OTEL_EXPORTER_OTLP_ENDPOINT`).
+## Quick start
 
-## Surface
+### Prerequisites
 
-| Endpoint | Method | Auth | Purpose |
-|---|---|---|---|
-| `/health`, `/healthz`, `/readyz` | GET | none | Liveness / readiness |
-| `/mcp/tools/list` | POST | `X-API-Key` | JSON-RPC 2.0 — tool catalogue scoped to partner |
-| `/mcp/tools/call` | POST | `X-API-Key` | JSON-RPC 2.0 — execute a tool |
+- Go 1.26.1 or newer
+- Docker only if you want to build the container image
 
-## Tools
+### Run locally
 
-Tool execution fans out to the owning Chora domain service over the HTTP-client
-seam (`internal/adapter/clients`, `Dispatcher`). The partner's owning tenant is
-propagated as `X-Tenant-Id`; results carry a `citations` array derived from the
-**real** upstream entities (IMDA D4 Transparency) — never a stub.
-
-| Name | Scope | Status | Upstream route |
-|---|---|---|---|
-| `course_catalog` | `mcp:read` | **wired** | `GET {MCP_UPSTREAM_DELIVERY}/api/courses` (tenant-only) |
-| `learning_path_query` | `mcp:read` | **wired** | `GET {MCP_UPSTREAM_CONSUMPTION}/api/learning-paths` (tenant-only; optional `learner_gcid` filter) |
-| `atom_search` | `mcp:read` | **fail-loud** | chora-creation gates `/api/atoms` on a learner `gcid` an AGID-only partner cannot supply |
-| `governance_check` | `mcp:read` | **fail-loud** | chora-governance `/api/gatekeeper/evaluate` requires a `gcid` the partner cannot supply |
-| `familiar_nudge` | `mcp:write` | **fail-loud** | chora-consumption exposes no HTTP nudge route |
-
-Fail-loud tools return a `tools/call` result with `isError: true` and zero
-citations — they never fabricate a success. `model_broker_invoke` was **removed**
-(ADR-146 retired `chora-model-broker-router`; the chokepoint `chora-model-gateway`
-is gRPC-only with no HTTP invoke route reachable over this seam).
-
-## Identity model
-
-External callers send a per-partner API key via `X-API-Key`. The gateway resolves
-the key against the chora-a2a-gateway partner registry. When no gateway URL is
-configured, a local-dev `internal/adapter/inmem.StaticResolver` can be seeded
-from `MCP_DEV_SEED_API_KEYS`; an unconfigured process refuses to boot rather than
-running with a silently-empty resolver.
-
-The resolved `Identity` carries an **AGID** (UUIDv7) — distinct from GCID. The
-`Identity` struct intentionally has no `Gcid` field; agents cannot hold
-TenantMembership.
-
-It also carries a **`TenantID`** — the tenant that purchased the per-tenant MCP
-add-on and minted the API key (`POST /admin/mcp/{tenant_id}` in
-chora-a2a-gateway). This is the *data scope* the partner acts within (not a GCID,
-not an agent TenantMembership) and is propagated to upstream domain services as
-`X-Tenant-Id`. An empty `TenantID` makes tenant-scoped tools fail loud.
-
-## Requirements
-
-- Go 1.26+
-- Docker (optional, for the container image)
-
-## Configuration
-
-Copy `.env.example` to `.env` and fill in values. The `.env` file is ignored by
-Git. There is no inline configuration; every upstream URL comes from the
-environment.
-
-| Env var | Purpose |
-|---|---|
-| `PORT` | HTTP listen port (default 8080) |
-| `CHORA_ENV` | Deployment environment label |
-| `CHORA_SOURCE_PROJECT` | Event/source project label (default `chora-local`) |
-| `MCP_UPSTREAM_A2A_GATEWAY` | chora-a2a-gateway base URL (partner registry) |
-| `MCP_UPSTREAM_DELIVERY` | chora-delivery base URL (course_catalog) |
-| `MCP_UPSTREAM_CONSUMPTION` | chora-consumption base URL (learning_path_query) |
-| `MCP_UPSTREAM_CREATION` | chora-creation base URL (atom_search — fail-loud today) |
-| `MCP_UPSTREAM_GOVERNANCE` | chora-governance base URL (governance_check — fail-loud today) |
-| `MCP_DEV_SEED_API_KEYS` | Dev-only `key:agid:tenant_id:tool1,tool2` seed (NEVER set in prod) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/gRPC trace endpoint (the OTel Collector) |
-
-(`MCP_UPSTREAM_MODEL_BROKER` was removed — ADR-146.)
-
-## Run locally
+The process requires either `MCP_UPSTREAM_A2A_GATEWAY` or the local-only `MCP_DEV_SEED_API_KEYS` setting. The example below uses the development resolver and starts the server on port 8096.
 
 ```sh
 PORT=8096 \
@@ -93,29 +21,191 @@ MCP_DEV_SEED_API_KEYS=dev-key:01900000-0000-7000-8000-000000000001:01900000-0000
 go run ./cmd/server
 ```
 
-Then:
+In another shell, check the service:
 
 ```sh
 curl -s localhost:8096/readyz
 ```
 
-## Tests
+For an environment-based setup, copy `.env.example` to `.env` and export the values before starting the server. `.env` is ignored by Git.
 
-```sh
-go test ./...
-go test ./internal/domain/... -coverprofile=cover.out && go tool cover -func=cover.out | tail -1
+## Usage
+
+The service listens on `:8080` by default. Set `PORT` to change the HTTP port.
+
+### Health endpoints
+
+All three endpoints accept `GET`:
+
+- `/health`
+- `/healthz`
+- `/readyz`
+
+A successful response is:
+
+```json
+{"status":"ok","service":"chora-mcp-gateway"}
 ```
 
-## Observability
+### MCP endpoints
 
-W3C `traceparent`/`tracestate` are read on inbound, echoed via
-`X-Echoed-Traceparent`, and propagated onto every upstream fan-out request
-(gateway→domain hop unbroken). Server-side spans are exported over OTLP/gRPC to
-the endpoint in `OTEL_EXPORTER_OTLP_ENDPOINT` (stdout export when unset), using
-GenAI/OpenInference span attributes.
+Both MCP endpoints require the `X-API-Key` header and JSON-RPC 2.0 request bodies.
 
-## Container image
+#### List tools
+
+`POST /mcp/tools/list`
+
+The request method must be `tools/list`. The response contains only tools present in the authenticated partner's allowed-tool list.
+
+Example:
+
+```sh
+curl -s \
+  -H 'X-API-Key: dev-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  http://localhost:8096/mcp/tools/list
+```
+
+Each published tool includes:
+
+- `name`
+- `description`
+- `inputSchema`
+- `requiredScope`
+
+`requiredScope` is metadata only. Authorization is based on tool-name membership in the partner's allowlist.
+
+#### Call a tool
+
+`POST /mcp/tools/call`
+
+Use a request of the form:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "course_catalog",
+    "arguments": {
+      "limit": 10,
+      "offset": 0
+    }
+  }
+}
+```
+
+Example:
+
+```sh
+curl -s \
+  -H 'X-API-Key: dev-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"course_catalog","arguments":{"limit":10,"offset":0}}}' \
+  http://localhost:8096/mcp/tools/call
+```
+
+The current catalogue contains five tools:
+
+| Tool | Scope metadata | Current behavior |
+|---|---|---|
+| `course_catalog` | `mcp:read` | Calls `GET {MCP_UPSTREAM_DELIVERY}/api/courses` |
+| `learning_path_query` | `mcp:read` | Calls `GET {MCP_UPSTREAM_CONSUMPTION}/api/learning-paths` |
+| `atom_search` | `mcp:read` | Fails loudly because the upstream route requires a learner GCID |
+| `governance_check` | `mcp:read` | Fails loudly because the upstream route requires a GCID |
+| `familiar_nudge` | `mcp:write` | Fails loudly because no upstream HTTP nudge route exists |
+
+`course_catalog` supports optional numeric `limit` and `offset` arguments. `learning_path_query` supports an optional `learner_gcid` filter.
+
+Failed tool execution is returned as a JSON-RPC result with `isError: true` and no citations. Unknown tools return JSON-RPC error code `-32002`. A caller without permission for a known tool receives HTTP 403 with code `TOOL_NOT_ALLOWED`.
+
+### Authentication and tenant scope
+
+Production deployments set `MCP_UPSTREAM_A2A_GATEWAY`. The gateway sends the caller's API key to:
+
+```
+POST {MCP_UPSTREAM_A2A_GATEWAY}/admin/mcp/_resolve
+X-API-Key: <key>
+```
+
+The resolver response provides the partner AGID, tenant ID, tool allowlist, and active state. The authenticated tenant ID is propagated to upstream domain services as `X-Tenant-Id`. An empty tenant ID causes tenant-scoped tools to fail rather than using a default.
+
+For local development, `MCP_DEV_SEED_API_KEYS` accepts:
+
+```
+key:agid:tenant_id:tool1,tool2
+```
+
+The seed is local-development only. If neither the production resolver URL nor a development seed is configured, the process refuses to start.
+
+### Configuration
+
+| Variable | Description |
+|---|---|
+| `PORT` | HTTP listen port, default `8080` |
+| `CHORA_ENV` | Deployment environment label |
+| `CHORA_SOURCE_PROJECT` | Source/event project label, default `chora-local` |
+| `MCP_UPSTREAM_A2A_GATEWAY` | `chora-a2a-gateway` base URL used to resolve API keys |
+| `MCP_UPSTREAM_DELIVERY` | `chora-delivery` base URL |
+| `MCP_UPSTREAM_CONSUMPTION` | `chora-consumption` base URL |
+| `MCP_UPSTREAM_CREATION` | `chora-creation` base URL |
+| `MCP_UPSTREAM_GOVERNANCE` | `chora-governance` base URL |
+| `MCP_DEV_SEED_API_KEYS` | Local-only API-key seed in `key:agid:tenant_id:tool1,tool2` format |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/gRPC trace endpoint; unset falls back to stdout |
+
+There is no `MCP_UPSTREAM_MODEL_BROKER` setting and no `model_broker_invoke` tool.
+
+### Tracing
+
+The service uses OpenTelemetry tracing. Incoming W3C `traceparent` and `tracestate` context is propagated to upstream HTTP calls, and `X-Echoed-Traceparent` is returned when an inbound `traceparent` header is present. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to send traces to an OTLP/gRPC collector.
+
+### Container
+
+Build the image locally with:
 
 ```sh
 docker build -t chora-mcp-gateway .
+```
+
+The repository's GitHub Actions workflow publishes multi-architecture images for `linux/amd64` and `linux/arm64` on pushes to `main` and version tags.
+
+## Development
+
+The project is a single Go module:
+
+```text
+.
+├── cmd/server/              HTTP server entrypoint and bootstrap tests
+├── internal/adapter/clients Upstream HTTP clients and tool dispatcher
+├── internal/adapter/http    MCP and health handlers
+├── internal/adapter/inmem   Local API-key resolver
+├── internal/domain/auth     API-key authentication and identity
+├── internal/domain/capability Tool-name authorization
+├── internal/domain/tool      Tool catalogue and result types
+├── internal/observability    OpenTelemetry setup and HTTP tracing middleware
+├── .env.example              Example environment configuration
+├── Dockerfile                Container build
+├── go.mod
+└── go.sum
+```
+
+Run the full test suite with:
+
+```sh
+go test ./...
+```
+
+Run domain tests with coverage:
+
+```sh
+go test ./internal/domain/... -coverprofile=cover.out
+go tool cover -func=cover.out | tail -1
+```
+
+Build the server binary directly with:
+
+```sh
+go build ./cmd/server
 ```
